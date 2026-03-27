@@ -38,6 +38,14 @@ from ltx_video.models.transformers.transformer3d import Transformer3DModel
 from ltx_video.schedulers.rf import TimestepShifter
 from ltx_video.utils.skip_layer_strategy import SkipLayerStrategy
 from ltx_video.utils.prompt_enhance_utils import generate_cinematic_prompt
+from ltx_video.utils.trajectory_warp import (
+    aggregate_frame_tracks_to_latent,
+    apply_latent_warp_prior,
+    build_frame_level_tracks,
+    frame_to_latent_index,
+    init_anchor_memory,
+    load_results_trajectory,
+)
 from ltx_video.models.autoencoders.latent_upsampler import LatentUpsampler
 from ltx_video.models.autoencoders.vae_encode import (
     un_normalize_latents,
@@ -1095,6 +1103,47 @@ class LTXVideoPipeline(DiffusionPipeline):
             )
         )
         init_latents = latents.clone()  # Used for image_cond_noise_update
+        out_channels_per_patch = self.transformer.in_channels // math.prod(
+            self.patchifier.patch_size
+        )
+
+        trajectory_path = kwargs.get("trajectory_path")
+        trajectory_warp_every = int(kwargs.get("trajectory_warp_every", 2))
+        trajectory_alpha = float(kwargs.get("trajectory_alpha", 0.3))
+        trajectory_start_ratio = float(kwargs.get("trajectory_start_ratio", 0.2))
+        trajectory_end_ratio = float(kwargs.get("trajectory_end_ratio", 0.75))
+        trajectory_source_shrink = float(kwargs.get("trajectory_source_shrink", 0.8))
+        trajectory_target_expand = float(kwargs.get("trajectory_target_expand", 1.1))
+
+        latent_tracks = {}
+        anchor_memory = {}
+        anchor_frames: List[int] = []
+        if trajectory_path and is_video:
+            trajectory_results = load_results_trajectory(trajectory_path)
+            frame_tracks = build_frame_level_tracks(trajectory_results, num_frames)
+            latent_tracks = aggregate_frame_tracks_to_latent(
+                frame_tracks=frame_tracks,
+                num_frames=num_frames,
+                latent_num_frames=latent_num_frames,
+                video_scale_factor=self.video_scale_factor,
+                vae_scale_factor=self.vae_scale_factor,
+            )
+            anchor_frames = sorted(
+                {
+                    frame_to_latent_index(
+                        int(item.media_frame_number), self.video_scale_factor
+                    )
+                    for item in (conditioning_items or [])
+                }
+            )
+            anchor_memory = init_anchor_memory(
+                conditioning_items=conditioning_items,
+                latent_tracks=latent_tracks,
+                vae=self.vae,
+                vae_per_channel_normalize=vae_per_channel_normalize,
+                video_scale_factor=self.video_scale_factor,
+                source_shrink=trajectory_source_shrink,
+            )
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -1279,6 +1328,26 @@ class LTXVideoPipeline(DiffusionPipeline):
                     extra_step_kwargs,
                     stochastic_sampling=stochastic_sampling,
                 )
+                if trajectory_path and latent_tracks:
+                    latents = apply_latent_warp_prior(
+                        latents_tok=latents,
+                        patchifier=self.patchifier,
+                        latent_height=latent_height,
+                        latent_width=latent_width,
+                        out_channels=out_channels_per_patch,
+                        num_cond_latents=num_cond_latents,
+                        latent_tracks=latent_tracks,
+                        anchor_memory=anchor_memory,
+                        anchor_frames=anchor_frames,
+                        step_idx=i,
+                        num_steps=len(timesteps),
+                        warp_every=trajectory_warp_every,
+                        alpha=trajectory_alpha,
+                        start_ratio=trajectory_start_ratio,
+                        end_ratio=trajectory_end_ratio,
+                        source_shrink=trajectory_source_shrink,
+                        target_expand=trajectory_target_expand,
+                    )
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or (
@@ -1301,8 +1370,7 @@ class LTXVideoPipeline(DiffusionPipeline):
             latents=latents,
             output_height=latent_height,
             output_width=latent_width,
-            out_channels=self.transformer.in_channels
-            // math.prod(self.patchifier.patch_size),
+            out_channels=out_channels_per_patch,
         )
         if output_type != "latent":
             if self.vae.decoder.timestep_conditioning:
