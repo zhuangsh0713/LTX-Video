@@ -1,7 +1,8 @@
 import json
 import math
+import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -86,6 +87,200 @@ def clip_bbox(box: Box, frame_width: int, frame_height: int) -> Optional[Box]:
     if x1 >= x2 or y1 >= y2:
         return None
     return [x1, y1, x2, y2]
+
+
+def ann_to_xyxy(
+    ann: dict,
+    frame_width: int,
+    frame_height: int,
+) -> Optional[Box]:
+    bbox = ann.get("bbox")
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        return None
+    return clip_bbox(
+        _normalize_box_xywh(bbox),
+        frame_width=frame_width,
+        frame_height=frame_height,
+    )
+
+
+def _sort_keyframe_name(name: str) -> Tuple[int, str]:
+    stem = Path(name).stem
+    try:
+        return int(stem), name
+    except ValueError:
+        return math.inf, name
+
+
+def _results_json_to_exp_name(results_json_path: str | Path) -> str:
+    stem = Path(results_json_path).stem
+    suffix = "_results"
+    if stem.endswith(suffix):
+        return stem[: -len(suffix)]
+    return stem
+
+
+def _tokenize_name(text: str) -> set[str]:
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(text).lower())
+    return {token for token in normalized.split() if token and not token.isdigit()}
+
+
+def name_similarity(name_a: str, name_b: str) -> float:
+    ta = _tokenize_name(name_a)
+    tb = _tokenize_name(name_b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(len(ta | tb), 1)
+
+
+def compute_box_iou(box_a: Box, box_b: Box) -> float:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    inter = inter_w * inter_h
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter + 1e-8
+    return inter / union
+
+
+def build_object_name_map(results_data: dict) -> Dict[int, str]:
+    object_names: Dict[int, str] = {}
+    planning_frames = results_data.get("vlm_planning", {}).get("Frames", {})
+    for frame_idx in sorted(planning_frames.keys(), key=lambda value: int(value)):
+        objects = planning_frames[frame_idx]
+        if not isinstance(objects, list):
+            continue
+        for obj in objects:
+            obj_id = int(obj["id"])
+            obj_name = str(obj.get("name") or "").strip()
+            if obj_name and obj_id not in object_names:
+                object_names[obj_id] = obj_name
+    return object_names
+
+
+def match_anchor_annotations(
+    annotations: List[dict],
+    object_names: Dict[int, str],
+    frame_tracks: Dict[int, List[Optional[Box]]],
+    latent_tracks: LatentTrajectory,
+    start_frame: int,
+    tau_anchor: int,
+    vae_scale_factor: int,
+    frame_width: int,
+    frame_height: int,
+) -> Dict[int, Box]:
+    matched_boxes: Dict[int, Box] = {}
+    if not annotations:
+        return matched_boxes
+
+    candidates: List[Tuple[float, int, int, Box]] = []
+    for obj_id, obj_latent_boxes in latent_tracks.items():
+        if tau_anchor not in obj_latent_boxes:
+            continue
+        traj_box_frame = None
+        obj_track = frame_tracks.get(obj_id)
+        if obj_track and 0 <= start_frame < len(obj_track):
+            traj_box_frame = obj_track[start_frame]
+        for ann_idx, ann in enumerate(annotations):
+            ann_box_frame = ann_to_xyxy(
+                ann,
+                frame_width=frame_width,
+                frame_height=frame_height,
+            )
+            if ann_box_frame is None:
+                continue
+            score_name = name_similarity(
+                object_names.get(obj_id, ""),
+                str(ann.get("class_name") or ""),
+            )
+            score = score_name
+            if traj_box_frame is not None:
+                score = 0.65 * score_name + 0.35 * compute_box_iou(
+                    traj_box_frame, ann_box_frame
+                )
+            elif len(annotations) == 1:
+                score = max(score, 0.2)
+            candidates.append(
+                (
+                    score,
+                    obj_id,
+                    ann_idx,
+                    project_bbox_to_latent_grid(ann_box_frame, vae_scale_factor),
+                )
+            )
+
+    used_objects = set()
+    used_annotations = set()
+    for score, obj_id, ann_idx, ann_box in sorted(
+        candidates, key=lambda item: item[0], reverse=True
+    ):
+        if obj_id in used_objects or ann_idx in used_annotations:
+            continue
+        if score <= 0.05:
+            continue
+        matched_boxes[obj_id] = ann_box
+        used_objects.add(obj_id)
+        used_annotations.add(ann_idx)
+    return matched_boxes
+
+
+def build_anchor_boxes_from_mapping(
+    mapping_json_path: str | Path,
+    results_json_path: str | Path,
+    results_data: dict,
+    conditioning_items: Optional[List[Any]],
+    frame_tracks: Dict[int, List[Optional[Box]]],
+    latent_tracks: LatentTrajectory,
+    video_scale_factor: int,
+    vae_scale_factor: int,
+    frame_width: int = 720,
+    frame_height: int = 480,
+) -> Dict[Tuple[int, int], Box]:
+    if not mapping_json_path or not conditioning_items:
+        return {}
+
+    mapping_json_path = Path(mapping_json_path)
+    if not mapping_json_path.is_file():
+        return {}
+
+    mapping_data = json.loads(mapping_json_path.read_text(encoding="utf-8"))
+    exp_name = _results_json_to_exp_name(results_json_path)
+    mapping_entry = mapping_data.get(exp_name) or {}
+    keyframe_result = mapping_entry.get("keyframe_result") or {}
+    ordered_keyframes = sorted(keyframe_result.keys(), key=_sort_keyframe_name)
+    if not ordered_keyframes:
+        return {}
+
+    object_names = build_object_name_map(results_data)
+    anchor_boxes: Dict[Tuple[int, int], Box] = {}
+
+    for idx, item in enumerate(conditioning_items):
+        start_frame = int(item.media_frame_number)
+        tau_anchor = frame_to_latent_index(start_frame, video_scale_factor)
+        annotations = keyframe_result.get(ordered_keyframes[idx], []) if idx < len(ordered_keyframes) else []
+        matched_boxes = match_anchor_annotations(
+            annotations=annotations,
+            object_names=object_names,
+            frame_tracks=frame_tracks,
+            latent_tracks=latent_tracks,
+            start_frame=start_frame,
+            tau_anchor=tau_anchor,
+            vae_scale_factor=vae_scale_factor,
+            frame_width=frame_width,
+            frame_height=frame_height,
+        )
+        for obj_id, obj_latent_boxes in latent_tracks.items():
+            fallback_box = obj_latent_boxes.get(tau_anchor)
+            anchor_box = matched_boxes.get(obj_id, fallback_box)
+            if anchor_box is not None:
+                anchor_boxes[(obj_id, tau_anchor)] = anchor_box
+    return anchor_boxes
 
 
 def build_frame_level_tracks(
@@ -314,7 +509,7 @@ def triangle_weights(u: float) -> Tuple[float, float, float]:
 
 def init_anchor_memory(
     conditioning_items,
-    latent_tracks: LatentTrajectory,
+    anchor_boxes: Dict[Tuple[int, int], Box],
     vae,
     vae_per_channel_normalize: bool,
     video_scale_factor: int,
@@ -335,8 +530,9 @@ def init_anchor_memory(
                 vae_per_channel_normalize=vae_per_channel_normalize,
             )
             anchor_frame = media_latents[:, :, 0]
-            for obj_id, obj_latent_boxes in latent_tracks.items():
-                box = obj_latent_boxes.get(tau_anchor)
+            for (obj_id, tau_box), box in anchor_boxes.items():
+                if tau_box != tau_anchor:
+                    continue
                 if box is None:
                     continue
                 patch = crop_latent_patch(anchor_frame, shrink_box(box, source_shrink))

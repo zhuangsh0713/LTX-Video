@@ -5,6 +5,7 @@ import math
 import re
 from contextlib import nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -41,6 +42,7 @@ from ltx_video.utils.prompt_enhance_utils import generate_cinematic_prompt
 from ltx_video.utils.trajectory_warp import (
     aggregate_frame_tracks_to_latent,
     apply_latent_warp_prior,
+    build_anchor_boxes_from_mapping,
     build_frame_level_tracks,
     frame_to_latent_index,
     init_anchor_memory,
@@ -1108,6 +1110,7 @@ class LTXVideoPipeline(DiffusionPipeline):
         )
 
         trajectory_path = kwargs.get("trajectory_path")
+        trajectory_mapping_path = kwargs.get("trajectory_mapping_path")
         trajectory_warp_every = int(kwargs.get("trajectory_warp_every", 2))
         trajectory_alpha = float(kwargs.get("trajectory_alpha", 0.3))
         trajectory_start_ratio = float(kwargs.get("trajectory_start_ratio", 0.2))
@@ -1116,10 +1119,15 @@ class LTXVideoPipeline(DiffusionPipeline):
         trajectory_target_expand = float(kwargs.get("trajectory_target_expand", 1.1))
 
         latent_tracks = {}
+        anchor_boxes = {}
         anchor_memory = {}
         anchor_frames: List[int] = []
         if trajectory_path and is_video:
             trajectory_results = load_results_trajectory(trajectory_path)
+            if trajectory_mapping_path is None:
+                candidate = Path(trajectory_path).resolve().parents[1] / "mappings" / "all_mappings.json"
+                if candidate.is_file():
+                    trajectory_mapping_path = str(candidate)
             frame_tracks = build_frame_level_tracks(trajectory_results, num_frames)
             latent_tracks = aggregate_frame_tracks_to_latent(
                 frame_tracks=frame_tracks,
@@ -1136,9 +1144,19 @@ class LTXVideoPipeline(DiffusionPipeline):
                     for item in (conditioning_items or [])
                 }
             )
+            anchor_boxes = build_anchor_boxes_from_mapping(
+                mapping_json_path=trajectory_mapping_path,
+                results_json_path=trajectory_path,
+                results_data=trajectory_results,
+                conditioning_items=conditioning_items,
+                frame_tracks=frame_tracks,
+                latent_tracks=latent_tracks,
+                video_scale_factor=self.video_scale_factor,
+                vae_scale_factor=self.vae_scale_factor,
+            )
             anchor_memory = init_anchor_memory(
                 conditioning_items=conditioning_items,
-                latent_tracks=latent_tracks,
+                anchor_boxes=anchor_boxes,
                 vae=self.vae,
                 vae_per_channel_normalize=vae_per_channel_normalize,
                 video_scale_factor=self.video_scale_factor,

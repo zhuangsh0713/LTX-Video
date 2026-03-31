@@ -390,6 +390,16 @@ class InferenceConfig:
             "help": "Path to a VisCoT results json containing `vlm_planning.Frames` used for latent trajectory warp guidance."
         },
     )
+    trajectory_mapping_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Optional path to mapping json containing `keyframe_result` used to crop anchor appearance from real keyframe annotations."
+        },
+    )
+    trajectory_anchor_metadata_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Compatibility flag for older trajectory configs; currently unused."},
+    )
     trajectory_warp_every: int = field(
         default=2,
         metadata={"help": "Apply latent trajectory warp every N diffusion steps."},
@@ -413,6 +423,22 @@ class InferenceConfig:
     trajectory_target_expand: float = field(
         default=1.1,
         metadata={"help": "Expand ratio for the target blend region of latent warp guidance."},
+    )
+    trajectory_center_kappa: float = field(
+        default=0.5,
+        metadata={"help": "Compatibility flag for older trajectory configs; currently unused."},
+    )
+    trajectory_anchor_radius: int = field(
+        default=2,
+        metadata={"help": "Compatibility flag for older trajectory configs; currently unused."},
+    )
+    trajectory_appearance_anchor_weight: float = field(
+        default=0.8,
+        metadata={"help": "Compatibility flag for older trajectory configs; currently unused."},
+    )
+    trajectory_appearance_prev_weight: float = field(
+        default=0.2,
+        metadata={"help": "Compatibility flag for older trajectory configs; currently unused."},
     )
 
 
@@ -447,6 +473,7 @@ def infer(config: InferenceConfig):
     conditioning_strengths = config.conditioning_strengths
     conditioning_start_frames = config.conditioning_start_frames
     trajectory_path = config.trajectory_path
+    trajectory_mapping_path = config.trajectory_mapping_path
 
     # Validate conditioning arguments
     if conditioning_media_paths:
@@ -473,6 +500,8 @@ def infer(config: InferenceConfig):
             )
     if trajectory_path and not os.path.isfile(trajectory_path):
         raise FileNotFoundError(f"Trajectory json not found: {trajectory_path}")
+    if trajectory_mapping_path and not os.path.isfile(trajectory_mapping_path):
+        raise FileNotFoundError(f"Trajectory mapping json not found: {trajectory_mapping_path}")
 
     seed_everething(config.seed)
     if config.offload_to_cpu and not torch.cuda.is_available():
@@ -613,6 +642,7 @@ def infer(config: InferenceConfig):
         media_items=media_item,
         conditioning_items=conditioning_items,
         trajectory_path=trajectory_path,
+        trajectory_mapping_path=trajectory_mapping_path,
         trajectory_warp_every=config.trajectory_warp_every,
         trajectory_alpha=config.trajectory_alpha,
         trajectory_start_ratio=config.trajectory_start_ratio,
