@@ -404,6 +404,22 @@ class InferenceConfig:
         default=2,
         metadata={"help": "Apply latent trajectory warp every N diffusion steps."},
     )
+    trajectory_time_travel_repeat: int = field(
+        default=1,
+        metadata={"help": "Repeat guided sampling at the same timestep with re-noising in between. 1 disables time-travel."},
+    )
+    trajectory_time_travel_start_ratio: Optional[float] = field(
+        default=None,
+        metadata={"help": "Optional override for the relative diffusion step ratio where time-travel starts. If omitted, it follows `trajectory_start_ratio`."},
+    )
+    trajectory_time_travel_end_ratio: Optional[float] = field(
+        default=None,
+        metadata={"help": "Optional override for the relative diffusion step ratio where time-travel stops. If omitted, it follows `trajectory_end_ratio`."},
+    )
+    trajectory_time_travel_noise_scale: float = field(
+        default=0.35,
+        metadata={"help": "Re-noise strength multiplier for time-travel. Lower values preserve more of the guided latent and reduce oscillation."},
+    )
     trajectory_alpha: float = field(
         default=0.3,
         metadata={"help": "Blend strength for latent trajectory warp guidance."},
@@ -644,6 +660,10 @@ def infer(config: InferenceConfig):
         trajectory_path=trajectory_path,
         trajectory_mapping_path=trajectory_mapping_path,
         trajectory_warp_every=config.trajectory_warp_every,
+        trajectory_time_travel_repeat=config.trajectory_time_travel_repeat,
+        trajectory_time_travel_start_ratio=config.trajectory_time_travel_start_ratio,
+        trajectory_time_travel_end_ratio=config.trajectory_time_travel_end_ratio,
+        trajectory_time_travel_noise_scale=config.trajectory_time_travel_noise_scale,
         trajectory_alpha=config.trajectory_alpha,
         trajectory_start_ratio=config.trajectory_start_ratio,
         trajectory_end_ratio=config.trajectory_end_ratio,

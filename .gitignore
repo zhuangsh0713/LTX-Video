@@ -1,4 +1,12 @@
 __pycache__/
 *.pyc
 .vscode/
+.claude/
 condition_item/
+outputs/
+ltx_video.egg-info/
+
+command.txt
+extract_frame.py
+run_command.txt
+test.sh

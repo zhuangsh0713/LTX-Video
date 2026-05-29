@@ -47,6 +47,8 @@ from ltx_video.utils.trajectory_warp import (
     frame_to_latent_index,
     init_anchor_memory,
     load_results_trajectory,
+    should_apply_warp,
+    step_gate,
 )
 from ltx_video.models.autoencoders.latent_upsampler import LatentUpsampler
 from ltx_video.models.autoencoders.vae_encode import (
@@ -1112,9 +1114,37 @@ class LTXVideoPipeline(DiffusionPipeline):
         trajectory_path = kwargs.get("trajectory_path")
         trajectory_mapping_path = kwargs.get("trajectory_mapping_path")
         trajectory_warp_every = int(kwargs.get("trajectory_warp_every", 2))
+        trajectory_time_travel_repeat = max(
+            1, int(kwargs.get("trajectory_time_travel_repeat", 1))
+        )
+        trajectory_time_travel_start_ratio = kwargs.get(
+            "trajectory_time_travel_start_ratio"
+        )
+        trajectory_time_travel_end_ratio = kwargs.get("trajectory_time_travel_end_ratio")
+        if trajectory_time_travel_start_ratio is not None:
+            trajectory_time_travel_start_ratio = float(
+                trajectory_time_travel_start_ratio
+            )
+        if trajectory_time_travel_end_ratio is not None:
+            trajectory_time_travel_end_ratio = float(trajectory_time_travel_end_ratio)
         trajectory_alpha = float(kwargs.get("trajectory_alpha", 0.3))
-        trajectory_start_ratio = float(kwargs.get("trajectory_start_ratio", 0.2))
-        trajectory_end_ratio = float(kwargs.get("trajectory_end_ratio", 0.75))
+        trajectory_start_ratio = float(kwargs.get("trajectory_start_ratio", 0.1))
+        trajectory_end_ratio = float(kwargs.get("trajectory_end_ratio", 0.2))
+        if trajectory_time_travel_start_ratio is None:
+            trajectory_time_travel_start_ratio = trajectory_start_ratio
+        if trajectory_time_travel_end_ratio is None:
+            trajectory_time_travel_end_ratio = trajectory_end_ratio
+        if trajectory_time_travel_end_ratio < trajectory_time_travel_start_ratio:
+            (
+                trajectory_time_travel_start_ratio,
+                trajectory_time_travel_end_ratio,
+            ) = (
+                trajectory_time_travel_end_ratio,
+                trajectory_time_travel_start_ratio,
+            )
+        trajectory_time_travel_noise_scale = max(
+            0.0, min(1.0, float(kwargs.get("trajectory_time_travel_noise_scale", 0.35)))
+        )
         trajectory_source_shrink = float(kwargs.get("trajectory_source_shrink", 0.8))
         trajectory_target_expand = float(kwargs.get("trajectory_target_expand", 1.1))
 
@@ -1216,7 +1246,7 @@ class LTXVideoPipeline(DiffusionPipeline):
                 fractional_coords[:, 0] = fractional_coords[:, 0] * (1.0 / frame_rate)
 
                 if conditioning_mask is not None and image_cond_noise_scale > 0.0:
-                    latents = self.add_noise_to_image_conditioning_latents(
+                    latents_step = self.add_noise_to_image_conditioning_latents(
                         t,
                         init_latents,
                         latents,
@@ -1224,148 +1254,213 @@ class LTXVideoPipeline(DiffusionPipeline):
                         orig_conditioning_mask,
                         generator,
                     )
-
-                latent_model_input = (
-                    torch.cat([latents] * num_conds) if num_conds > 1 else latents
-                )
-                latent_model_input = self.scheduler.scale_model_input(
-                    latent_model_input, t
-                )
-
-                current_timestep = t
-                if not torch.is_tensor(current_timestep):
-                    # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-                    # This would be a good case for the `match` statement (Python 3.10+)
-                    is_mps = latent_model_input.device.type == "mps"
-                    if isinstance(current_timestep, float):
-                        dtype = torch.float32 if is_mps else torch.float64
-                    else:
-                        dtype = torch.int32 if is_mps else torch.int64
-                    current_timestep = torch.tensor(
-                        [current_timestep],
-                        dtype=dtype,
-                        device=latent_model_input.device,
-                    )
-                elif len(current_timestep.shape) == 0:
-                    current_timestep = current_timestep[None].to(
-                        latent_model_input.device
-                    )
-                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                current_timestep = current_timestep.expand(
-                    latent_model_input.shape[0]
-                ).unsqueeze(-1)
-
-                if conditioning_mask is not None:
-                    # Conditioning latents have an initial timestep and noising level of (1.0 - conditioning_mask)
-                    # and will start to be denoised when the current timestep is lower than their conditioning timestep.
-                    current_timestep = torch.min(
-                        current_timestep, 1.0 - conditioning_mask
-                    )
-
-                # Choose the appropriate context manager based on `mixed_precision`
-                if mixed_precision:
-                    context_manager = torch.autocast(device.type, dtype=torch.bfloat16)
                 else:
-                    context_manager = nullcontext()  # Dummy context manager
+                    latents_step = latents
 
-                # predict noise model_output
-                with context_manager:
-                    noise_pred = self.transformer(
-                        latent_model_input.to(self.transformer.dtype),
-                        indices_grid=fractional_coords,
-                        encoder_hidden_states=prompt_embeds_batch[indices].to(
-                            self.transformer.dtype
-                        ),
-                        encoder_attention_mask=prompt_attention_mask_batch[indices],
-                        timestep=current_timestep,
-                        skip_layer_mask=skip_layer_mask,
-                        skip_layer_strategy=skip_layer_strategy,
-                        return_dict=False,
-                    )[0]
-
-                # perform guidance
-                if do_spatio_temporal_guidance:
-                    noise_pred_text, noise_pred_text_perturb = noise_pred.chunk(
-                        num_conds
-                    )[-2:]
-                if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(num_conds)[:2]
-
-                    if cfg_star_rescale:
-                        # Rescales the unconditional noise prediction using the projection of the conditional prediction onto it:
-                        # α = (⟨ε_text, ε_uncond⟩ / ||ε_uncond||²), then ε_uncond ← α * ε_uncond
-                        # where ε_text is the conditional noise prediction and ε_uncond is the unconditional one.
-                        positive_flat = noise_pred_text.view(batch_size, -1)
-                        negative_flat = noise_pred_uncond.view(batch_size, -1)
-                        dot_product = torch.sum(
-                            positive_flat * negative_flat, dim=1, keepdim=True
-                        )
-                        squared_norm = (
-                            torch.sum(negative_flat**2, dim=1, keepdim=True) + 1e-8
-                        )
-                        alpha = dot_product / squared_norm
-                        noise_pred_uncond = alpha * noise_pred_uncond
-
-                    noise_pred = noise_pred_uncond + guidance_scale[i] * (
-                        noise_pred_text - noise_pred_uncond
-                    )
-                elif do_spatio_temporal_guidance:
-                    noise_pred = noise_pred_text
-                if do_spatio_temporal_guidance:
-                    noise_pred = noise_pred + stg_scale[i] * (
-                        noise_pred_text - noise_pred_text_perturb
-                    )
-                    if do_rescaling and stg_scale[i] > 0.0:
-                        noise_pred_text_std = noise_pred_text.view(batch_size, -1).std(
-                            dim=1, keepdim=True
-                        )
-                        noise_pred_std = noise_pred.view(batch_size, -1).std(
-                            dim=1, keepdim=True
-                        )
-
-                        factor = noise_pred_text_std / noise_pred_std
-                        factor = rescaling_scale[i] * factor + (1 - rescaling_scale[i])
-
-                        noise_pred = noise_pred * factor.view(batch_size, 1, 1)
-
-                current_timestep = current_timestep[:1]
-                # learned sigma
-                if (
-                    self.transformer.config.out_channels // 2
-                    == self.transformer.config.in_channels
-                ):
-                    noise_pred = noise_pred.chunk(2, dim=1)[0]
-
-                # compute previous image: x_t -> x_t-1
-                latents = self.denoising_step(
-                    latents,
-                    noise_pred,
-                    current_timestep,
-                    orig_conditioning_mask,
-                    t,
-                    extra_step_kwargs,
-                    stochastic_sampling=stochastic_sampling,
+                progress = i / max(len(timesteps) - 1, 1)
+                current_step_alpha = step_gate(
+                    i,
+                    len(timesteps),
+                    trajectory_start_ratio,
+                    trajectory_end_ratio,
+                    trajectory_alpha,
                 )
-                if trajectory_path and latent_tracks:
-                    latents = apply_latent_warp_prior(
-                        latents_tok=latents,
-                        patchifier=self.patchifier,
-                        latent_height=latent_height,
-                        latent_width=latent_width,
-                        out_channels=out_channels_per_patch,
-                        num_cond_latents=num_cond_latents,
-                        latent_tracks=latent_tracks,
-                        anchor_memory=anchor_memory,
-                        anchor_frames=anchor_frames,
-                        step_idx=i,
-                        num_steps=len(timesteps),
-                        warp_every=trajectory_warp_every,
-                        alpha=trajectory_alpha,
-                        start_ratio=trajectory_start_ratio,
-                        end_ratio=trajectory_end_ratio,
-                        source_shrink=trajectory_source_shrink,
-                        target_expand=trajectory_target_expand,
+                do_time_travel = (
+                    trajectory_path is not None
+                    and bool(latent_tracks)
+                    and trajectory_time_travel_repeat > 1
+                    and trajectory_time_travel_start_ratio <= progress <= trajectory_time_travel_end_ratio
+                    and should_apply_warp(i, trajectory_warp_every)
+                    and current_step_alpha > 0.0
+                )
+                repeat_steps = trajectory_time_travel_repeat if do_time_travel else 1
+                latents_t = latents_step
+                time_travel_noise = None
+                if do_time_travel and repeat_steps > 1 and trajectory_time_travel_noise_scale > 0.0:
+                    # Reuse the same noise within one timestep to avoid injecting a new random direction
+                    # on every repeat, which was causing visible oscillation.
+                    time_travel_noise = randn_tensor(
+                        latents_step.shape,
+                        generator=generator,
+                        device=latents_step.device,
+                        dtype=latents_step.dtype,
                     )
+
+                for tt_idx in range(repeat_steps):
+                    latent_model_input = (
+                        torch.cat([latents_t] * num_conds) if num_conds > 1 else latents_t
+                    )
+                    latent_model_input = self.scheduler.scale_model_input(
+                        latent_model_input, t
+                    )
+
+                    current_timestep = t
+                    if not torch.is_tensor(current_timestep):
+                        # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
+                        # This would be a good case for the `match` statement (Python 3.10+)
+                        is_mps = latent_model_input.device.type == "mps"
+                        if isinstance(current_timestep, float):
+                            dtype = torch.float32 if is_mps else torch.float64
+                        else:
+                            dtype = torch.int32 if is_mps else torch.int64
+                        current_timestep = torch.tensor(
+                            [current_timestep],
+                            dtype=dtype,
+                            device=latent_model_input.device,
+                        )
+                    elif len(current_timestep.shape) == 0:
+                        current_timestep = current_timestep[None].to(
+                            latent_model_input.device
+                        )
+                    # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+                    current_timestep = current_timestep.expand(
+                        latent_model_input.shape[0]
+                    ).unsqueeze(-1)
+
+                    if conditioning_mask is not None:
+                        # Conditioning latents have an initial timestep and noising level of (1.0 - conditioning_mask)
+                        # and will start to be denoised when the current timestep is lower than their conditioning timestep.
+                        current_timestep = torch.min(
+                            current_timestep, 1.0 - conditioning_mask
+                        )
+
+                    # Choose the appropriate context manager based on `mixed_precision`
+                    if mixed_precision:
+                        context_manager = torch.autocast(
+                            device.type, dtype=torch.bfloat16
+                        )
+                    else:
+                        context_manager = nullcontext()  # Dummy context manager
+
+                    # predict noise model_output
+                    with context_manager:
+                        noise_pred = self.transformer(
+                            latent_model_input.to(self.transformer.dtype),
+                            indices_grid=fractional_coords,
+                            encoder_hidden_states=prompt_embeds_batch[indices].to(
+                                self.transformer.dtype
+                            ),
+                            encoder_attention_mask=prompt_attention_mask_batch[indices],
+                            timestep=current_timestep,
+                            skip_layer_mask=skip_layer_mask,
+                            skip_layer_strategy=skip_layer_strategy,
+                            return_dict=False,
+                        )[0]
+
+                    # perform guidance
+                    if do_spatio_temporal_guidance:
+                        noise_pred_text, noise_pred_text_perturb = noise_pred.chunk(
+                            num_conds
+                        )[-2:]
+                    if do_classifier_free_guidance:
+                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(
+                            num_conds
+                        )[:2]
+
+                        if cfg_star_rescale:
+                            # Rescales the unconditional noise prediction using the projection of the conditional prediction onto it:
+                            # α = (⟨ε_text, ε_uncond⟩ / ||ε_uncond||²), then ε_uncond ← α * ε_uncond
+                            # where ε_text is the conditional noise prediction and ε_uncond is the unconditional one.
+                            positive_flat = noise_pred_text.view(batch_size, -1)
+                            negative_flat = noise_pred_uncond.view(batch_size, -1)
+                            dot_product = torch.sum(
+                                positive_flat * negative_flat, dim=1, keepdim=True
+                            )
+                            squared_norm = (
+                                torch.sum(negative_flat**2, dim=1, keepdim=True)
+                                + 1e-8
+                            )
+                            alpha = dot_product / squared_norm
+                            noise_pred_uncond = alpha * noise_pred_uncond
+
+                        noise_pred = noise_pred_uncond + guidance_scale[i] * (
+                            noise_pred_text - noise_pred_uncond
+                        )
+                    elif do_spatio_temporal_guidance:
+                        noise_pred = noise_pred_text
+                    if do_spatio_temporal_guidance:
+                        noise_pred = noise_pred + stg_scale[i] * (
+                            noise_pred_text - noise_pred_text_perturb
+                        )
+                        if do_rescaling and stg_scale[i] > 0.0:
+                            noise_pred_text_std = noise_pred_text.view(
+                                batch_size, -1
+                            ).std(dim=1, keepdim=True)
+                            noise_pred_std = noise_pred.view(batch_size, -1).std(
+                                dim=1, keepdim=True
+                            )
+
+                            factor = noise_pred_text_std / noise_pred_std
+                            factor = rescaling_scale[i] * factor + (
+                                1 - rescaling_scale[i]
+                            )
+
+                            noise_pred = noise_pred * factor.view(batch_size, 1, 1)
+
+                    current_timestep_step = current_timestep[:1]
+                    # learned sigma
+                    if (
+                        self.transformer.config.out_channels // 2
+                        == self.transformer.config.in_channels
+                    ):
+                        noise_pred = noise_pred.chunk(2, dim=1)[0]
+
+                    # compute previous image: x_t -> x_t-1
+                    latents_t_minus_1 = self.denoising_step(
+                        latents_t,
+                        noise_pred,
+                        current_timestep_step,
+                        orig_conditioning_mask,
+                        t,
+                        extra_step_kwargs,
+                        stochastic_sampling=stochastic_sampling,
+                    )
+                    if trajectory_path and latent_tracks:
+                        latents_t_minus_1 = apply_latent_warp_prior(
+                            latents_tok=latents_t_minus_1,
+                            patchifier=self.patchifier,
+                            latent_height=latent_height,
+                            latent_width=latent_width,
+                            out_channels=out_channels_per_patch,
+                            num_cond_latents=num_cond_latents,
+                            latent_tracks=latent_tracks,
+                            anchor_memory=anchor_memory,
+                            anchor_frames=anchor_frames,
+                            step_idx=i,
+                            num_steps=len(timesteps),
+                            warp_every=trajectory_warp_every,
+                            alpha=trajectory_alpha,
+                            start_ratio=trajectory_start_ratio,
+                            end_ratio=trajectory_end_ratio,
+                            source_shrink=trajectory_source_shrink,
+                            target_expand=trajectory_target_expand,
+                        )
+
+                    if tt_idx < repeat_steps - 1:
+                        if time_travel_noise is None:
+                            renoised_latents = latents_t_minus_1
+                        else:
+                            renoise_timestep = (
+                                current_timestep_step * trajectory_time_travel_noise_scale
+                            )
+                            renoised_latents = self.scheduler.add_noise(
+                                latents_t_minus_1,
+                                time_travel_noise,
+                                renoise_timestep,
+                            )
+                        if orig_conditioning_mask is not None:
+                            tokens_to_renoise_mask = (
+                                t - 1e-6 < (1.0 - orig_conditioning_mask)
+                            ).unsqueeze(-1)
+                            latents_t = torch.where(
+                                tokens_to_renoise_mask,
+                                renoised_latents,
+                                latents_t_minus_1,
+                            )
+                        else:
+                            latents_t = renoised_latents
+                    else:
+                        latents = latents_t_minus_1
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or (
