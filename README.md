@@ -13,6 +13,32 @@ This is the official repository for LTX-Video.
 
 </div>
 
+---
+
+## 🚀 **New: LTX-2 is Now Available!**
+
+**We're excited to announce [LTX-2](https://github.com/Lightricks/LTX-2) - the next generation of LTX with synchronized audio+video generation!**
+
+LTX-2 is the first DiT-based audio-video foundation model that contains all core capabilities of modern video generation in one model. **LTX-2 is now the primary home for LTX development** and includes significant improvements:
+
+- 🎵 **Synchronized Audio+Video Generation** - Generate videos with perfectly synchronized audio
+- 🎬 **Latest Model** - LTX-2 with improved quality and capabilities
+- 🔌 **ComfyUI Integration** - Built into ComfyUI core for seamless workflows
+- 🎯 **Advanced Features:**
+  - Multiple keyframe support
+  - IC-LoRA control models for precise generation
+  - Standard LoRA support for style customization
+  - Latent upsampler for multiscale pipelines
+- 🛠️ **Training Tools** - LoRA training capabilities
+- 📚 **Comprehensive Documentation** - Full documentation at [https://docs.ltx.video](https://docs.ltx.video)
+- 🔄 **Active Development** - Ongoing improvements and community support
+
+**[👉 Check out LTX-2 here](https://github.com/Lightricks/LTX-2)**
+
+**[📖 View Documentation](https://docs.ltx.video)**
+
+---
+
 ## Table of Contents
 
 - [Introduction](#introduction)
